@@ -1,0 +1,65 @@
+# Project
+A matching engine that identifies equivalent prediction-market contracts across Kalshi and Polymarket, so a downstream arbitrage system can treat them as one book.
+
+The core problem: both venues list "Will the Fed cut rates in June?" but the contracts aren't always the same semantically and in resolution. We seek to reliably determine which contracts are actually the same due to their semantic similarities.
+
+---
+
+## Pipeline
+
+The pipeline has four stages:
+
+**1. Fetch** — `fetch_markets.py` pulls live contracts from both venues and writes timestamped JSON snapshots to `data/snapshots/`. Everything downstream reads these files rather than hitting the APIs directly. Prediction markets change daily, so data older than ~24 hours gets a staleness warning before labeling.
+
+**2. Canonicalize** — both sides get mapped into a shared schema (`canonical.py`) with five semantic fields: 
+WHAT (`anchor`), W
+HEN (`occurrence`), 
+HOW (`measurement`), 
+OUTCOME STRUCTURE (`shape`), 
+and RESOLUTION AUTHORITY (`resolution`). 
+Kalshi is machine-readable so `compare_pair.py` parses it structurally. Polymarket buries everything in free-text `description` prose, so
+`extract.py` sends each market to Claude and uses tool use to fill in the same schema — output is cached to `data/canonical/polymarket/`.
+
+**3. Candidate retrieval (to be improved)** — `candidate_pairs.py` does a fast token-overlap filter across all Kalshi × Polymarket pairs and writes `data/candidates.jsonl`. This avoids the O(N×M) LLM cost of comparing every contract with each other in pairs. Only pairs that share enough significant keywords get passed to the judge. This can be majorly improved with an embedding technique instead of the current naive keyword match algorithm.
+
+**4. Judge** — `judge.py` calls Claude API with a cached system prompt containing the label taxonomy and sends one candidate pair at a time. It returns one of:
+`EQUIVALENT`, `SUBSET`, `SYNTHETIC`, or `UNRELATED`. The system prompt is sent with `cache_control: ephemeral` so the first call in a session pays the write cost and subsequent calls are cache hits to save time and money.
+
+---
+
+## CODE
+
+```
+python3 fetch_markets.py [kalshi|polymarket] ...   pull + cache live contracts
+python3 extract.py data/snapshots/polymarket/*.json  canonicalize Polymarket side
+python3 candidate_pairs.py                         token-overlap filter → candidates.jsonl
+python3 compare_pair.py <kalshi-ticker> <pm-id>    side-by-side inspection + draft label
+python3 judge.py                                   run LLM judge on test pairs
+python3 canonical.py                               schema sanity check
+python3 getDune.py <query-id>                      pull Dune query data (needs query ID)
+```
+
+## Setup
+```
+python3 -m pip install -r requirements.txt
+fill .env if hidden
+```
+
+## RUN
+python fetch_markets.py kalshi
+python fetch_markets.py polymarket
+python extract.py data/snapshots/polymarket/*.json
+python candidate_pairs.py
+python judge.py (runs 3 hardcoded test pairs currently, need api key!)
+
+---
+
+
+## FAILURE POINTS
+
+- **Scope.** "Fed cuts in 2026" (annual cumulative) vs. "Fed cuts at the June meeting" (single point) — same tokens, different contracts. Label: `synthetic`.
+- **Thresholds.** "Bitcoin above $120k" vs. "Bitcoin above $125k" — nearly
+  identical embeddings, not the same bet. need to make more exact
+- **Resolution details.** Whether emergency/unscheduled events count, who the resolution authority is, exact cutoff times — all buried in prose that a title comparison ignores.
+
+see `docs/project_brief.md` §3–4 for worked Fed example.
